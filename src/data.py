@@ -1,34 +1,20 @@
-import pandas as pd
-from pathlib import Path
-from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+import torch
+from torch.utils.data import DataLoader, ConcatDataset, random_split
 from torchvision import transforms
+from torchvision.datasets import OxfordIIITPet
 
 
-class PetsDataset(Dataset):
-    def __init__(self, annotations_file, img_dir, transform=None):
-        df = pd.read_csv(
-            annotations_file,
-            sep=" ", comment="#",
-            names=["image_id", "class_id", "species", "breed_id"]
-        )
-        df["path"] = df["image_id"].apply(lambda x: Path(img_dir) / f"{x}.jpg")
-        df["label"] = df["class_id"] - 1
-        self.df = df.reset_index(drop=True)
-        self.transform = transform
+TRAIN_TRANSFORM = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(15),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225]),
+])
 
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        image = Image.open(self.df.loc[idx, "path"]).convert("RGB")
-        label = self.df.loc[idx, "label"]
-        if self.transform:
-            image = self.transform(image)
-        return image, label
-
-
-DEFAULT_TRANSFORM = transforms.Compose([
+TEST_TRANSFORM = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406],
@@ -36,19 +22,55 @@ DEFAULT_TRANSFORM = transforms.Compose([
 ])
 
 
-def get_loaders(
-    annotations_dir="annotations",
-    images_dir="images",
-    batch_size=32,
-    num_workers=4,
-    transform=None,
-):
-    t = transform or DEFAULT_TRANSFORM
+class TransformSubset(torch.utils.data.Dataset):
+    def __init__(self, subset, transform):
+        self.subset = subset
+        self.transform = transform
 
-    train_dataset = PetsDataset(f"{annotations_dir}/trainval.txt", images_dir, transform=t)
-    test_dataset  = PetsDataset(f"{annotations_dir}/test.txt",     images_dir, transform=t)
+    def __len__(self):
+        return len(self.subset)
+
+    def __getitem__(self, idx):
+        img, label = self.subset[idx]
+        return self.transform(img), label
+
+
+def get_loaders(
+    root: str = "data",
+    batch_size: int = 32,
+    num_workers: int = 4,
+    train_ratio: float = 0.8,
+    seed: int = 50,
+) -> tuple[DataLoader, DataLoader]:
+    trainval = OxfordIIITPet(root=root, split="trainval", target_types="category", transform=None, download=True)
+    test     = OxfordIIITPet(root=root, split="test",     target_types="category", transform=None, download=True)
+
+    full_dataset = ConcatDataset([trainval, test])
+
+    total      = len(full_dataset)
+    train_size = int(total * train_ratio)
+    test_size  = total - train_size
+
+    train_subset, test_subset = random_split(
+        full_dataset,
+        [train_size, test_size],
+        generator=torch.Generator().manual_seed(seed),
+    )
+
+    train_dataset = TransformSubset(train_subset, TRAIN_TRANSFORM)
+    test_dataset  = TransformSubset(test_subset,  TEST_TRANSFORM)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=num_workers)
     test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     return train_loader, test_loader
+
+
+if __name__ == "__main__":
+    train_loader, test_loader = get_loaders()
+    print(f"Train batches : {len(train_loader)}  ({len(train_loader.dataset)} samples)")
+    print(f"Test  batches : {len(test_loader)}  ({len(test_loader.dataset)} samples)")
+
+    imgs, labels = next(iter(train_loader))
+    print(f"Batch shape   : {imgs.shape}")
+    print(f"Labels shape  : {labels.shape}")
